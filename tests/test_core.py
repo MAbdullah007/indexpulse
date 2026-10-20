@@ -1,0 +1,265 @@
+"""
+Run:  pytest -q
+These tests use fake API replies, so they cost no credits and need no internet.
+"""
+
+import gzip
+import json
+import os
+import sys
+
+import pandas as pd
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import core  # noqa: E402
+from core import V  # noqa: E402
+
+TARGET = "https://velog.io/@stories/How-to-Choose"
+
+
+# ---------------------------------------------------------------- fakes
+class FakeResp:
+    def __init__(self, status=200, data=None, text=None, url="https://x.test/", headers=None, content=None, history=None):
+        self.status_code = status
+        self._data = data
+        self.text = text if text is not None else (json.dumps(data) if data is not None else "")
+        self.url = url
+        self.headers = headers or {}
+        self.content = content if content is not None else self.text.encode()
+        self.history = history or []
+
+    def json(self):
+        if self._data is None:
+            raise ValueError("no json")
+        return self._data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(self.status_code)
+
+
+class FakeSession:
+    def __init__(self, handler):
+        self.handler = handler
+        self.calls = []
+
+    def get(self, url, **kw):
+        self.calls.append(("GET", url, kw))
+        return self.handler("GET", url, kw)
+
+    def post(self, url, **kw):
+        self.calls.append(("POST", url, kw))
+        return self.handler("POST", url, kw)
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    def install(handler):
+        s = FakeSession(handler)
+        monkeypatch.setattr(core, "http", lambda: s)
+        return s
+    return install
+
+
+# ---------------------------------------------------------------- URL matching
+def test_canonical_rules():
+    c = core.canonical_url
+    assert c("https://www.Example.com/A//b/?utm_source=x&id=2#top") == "example.com/A/b?id=2"
+    assert c("example.com/a/") == c("http://www.example.com/a")
+    assert c("site.com/p?id=1") != c("site.com/p?id=2")
+    assert c("https://velog.io/%40stories/X") == "velog.io/@stories/X"
+    assert c("https://a.com/x?srsltid=abc") == "a.com/x"
+
+
+def test_judge_cases():
+    assert core.judge(TARGET, [(TARGET + "/?srsltid=1", "t")])["verdict"] == V.INDEXED
+    assert core.judge(TARGET, [(TARGET.lower(), "t")])["verdict"] == V.OTHER
+    assert core.judge(TARGET, [("https://velog.io/@stories", "t")])["verdict"] == V.OTHER
+    assert core.judge(TARGET, [])["verdict"] == V.NOT
+
+
+def test_prepare_urls():
+    valid, invalid, dupes = core.prepare_urls(["a.com/x", "https://www.a.com/x/", "nonsense", "", "# comment"])
+    assert valid == ["a.com/x"] and invalid == ["nonsense"] and dupes == 1
+
+
+# ---------------------------------------------------------------- engines
+def test_serper_indexed_and_errors(fake):
+    fake(lambda m, u, kw: FakeResp(200, {"organic": [{"link": TARGET, "title": "T"}]}))
+    assert core.check_serper(TARGET, {"key": "k"}, True)["verdict"] == V.INDEXED
+
+    fake(lambda m, u, kw: FakeResp(403, {"message": "Unauthorized"}))
+    with pytest.raises(core.EngineDown, match="key"):
+        core.check_serper(TARGET, {"key": "k"}, True)
+
+    fake(lambda m, u, kw: FakeResp(400, {"message": "Not enough credits"}))
+    with pytest.raises(core.EngineDown, match="credits"):
+        core.check_serper(TARGET, {"key": "k"}, True)
+
+
+def test_serpapi_no_cache_and_states(fake):
+    s = fake(lambda m, u, kw: FakeResp(200, {"organic_results": [{"link": TARGET, "title": "T"}]}))
+    assert core.check_serpapi(TARGET, {"key": "k"}, True)["verdict"] == V.INDEXED
+    assert s.calls[0][2]["params"]["no_cache"] == "true"  # fresh results, never cached
+
+    fake(lambda m, u, kw: FakeResp(200, {"error": "Google hasn't returned any results for this query."}))
+    assert core.check_serpapi(TARGET, {"key": "k"}, True)["verdict"] == V.NOT
+
+    fake(lambda m, u, kw: FakeResp(429, {"error": "Your account has run out of searches."}))
+    with pytest.raises(core.EngineDown, match="used up"):
+        core.check_serpapi(TARGET, {"key": "k"}, True)
+
+    fake(lambda m, u, kw: FakeResp(401, {"error": "Invalid API key."}))
+    with pytest.raises(core.EngineDown, match="wrong"):
+        core.check_serpapi(TARGET, {"key": "k"}, True)
+
+
+def test_brightdata(fake):
+    s = fake(lambda m, u, kw: FakeResp(200, {"general": {}, "organic": [{"link": TARGET, "title": "T"}]}))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.INDEXED
+    sent = s.calls[0][2]["json"]
+    assert sent["zone"] == "z" and "brd_json=1" in sent["url"] and "site%3A" in sent["url"]
+
+    fake(lambda m, u, kw: FakeResp(200, {"general": {"results_cnt": 0}}))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.NOT
+
+    fake(lambda m, u, kw: FakeResp(200, text="<html>not json</html>"))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.UNKNOWN
+
+    fake(lambda m, u, kw: FakeResp(401, text="Invalid token"))
+    with pytest.raises(core.EngineDown, match="wrong"):
+        core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)
+
+
+def test_direct_block_and_js_wall(fake):
+    fake(lambda m, u, kw: FakeResp(429, text="unusual traffic", url="https://www.google.com/sorry/index"))
+    with pytest.raises(core.EngineDown):
+        core.check_direct(TARGET, {"delay": 0}, True)
+
+    fake(lambda m, u, kw: FakeResp(200, text="<html><noscript>enable js</noscript></html>"))
+    assert core.check_direct(TARGET, {"delay": 0}, True)["verdict"] == V.UNKNOWN  # never a fake "Not indexed"
+
+    html = f'<a href="/url?q={TARGET}&sa=U"><h3>Title</h3></a><a href="https://support.google.com/x">help</a>'
+    fake(lambda m, u, kw: FakeResp(200, text=html))
+    assert core.check_direct(TARGET, {"delay": 0}, True)["verdict"] == V.INDEXED
+
+
+# ---------------------------------------------------------------- Search Console
+class FakeGSC(core.GSCClient):
+    def __init__(self, sites):
+        self.email = "bot@proj.iam.gserviceaccount.com"
+        self.sites = sites
+        self.exhausted = set()
+
+    def token(self):
+        return "tok"
+
+
+def test_gsc_property_matching():
+    c = FakeGSC(["sc-domain:example.com", "https://shop.other.com/"])
+    assert c.property_for("https://www.example.com/page") == "sc-domain:example.com"
+    assert c.property_for("https://shop.other.com/p/1") == "https://shop.other.com/"
+    assert c.property_for("https://other.com/") is None
+    assert c.property_for(TARGET) is None
+
+
+def _gsc_reply(coverage, verdict="NEUTRAL", **extra):
+    idx = {"verdict": verdict, "coverageState": coverage, **extra}
+    return FakeResp(200, {"inspectionResult": {"indexStatusResult": idx, "inspectionResultLink": "https://sc/link"}})
+
+
+def test_gsc_verdicts(fake):
+    c = FakeGSC(["sc-domain:example.com"])
+    url = "https://example.com/a"
+
+    fake(lambda m, u, kw: _gsc_reply("Submitted and indexed", "PASS", lastCrawlTime="2026-10-18T10:00:00Z"))
+    out = core.check_gsc(url, c, True)
+    assert out["verdict"] == V.INDEXED and out["proof_link"] == "https://sc/link" and "2026-10-18" in out["last_crawl"]
+
+    fake(lambda m, u, kw: _gsc_reply("Crawled - currently not indexed", lastCrawlTime="2026-10-01T10:00:00Z"))
+    assert core.check_gsc(url, c, True)["verdict"] == V.NOT
+
+    fake(lambda m, u, kw: _gsc_reply("URL is unknown to Google"))
+    out = core.check_gsc(url, c, True)
+    assert out["verdict"] == V.NOT and "never crawled" in out["likely_cause"]
+
+    fake(lambda m, u, kw: _gsc_reply("Duplicate, Google chose different canonical than user",
+                                     googleCanonical="https://example.com/b"))
+    assert core.check_gsc(url, c, True)["verdict"] == V.OTHER
+
+    fake(lambda m, u, kw: FakeResp(429, {"error": {"message": "Quota exceeded"}}))
+    with pytest.raises(core.Skip):
+        core.check_gsc(url, c, True)
+    assert "sc-domain:example.com" in c.exhausted
+
+    with pytest.raises(core.Skip):
+        core.check_gsc(TARGET, c, True)  # not your site → next engine
+
+
+# ---------------------------------------------------------------- fallback
+def test_fallback_when_engine_runs_out(fake):
+    def handler(m, u, kw):
+        if "serpapi.com" in u:
+            return FakeResp(429, {"error": "Your account has run out of searches."})
+        if "serper.dev" in u:
+            return FakeResp(200, {"organic": [{"link": TARGET, "title": "T"}]})
+        return FakeResp(200, text="<html></html>", headers={"Content-Type": "text/html"})
+
+    fake(handler)
+    cfgs = {"serpapi": {"key": "a"}, "serper": {"key": "b"}}
+    results, state = core.run_checks([TARGET, TARGET + "-2"], ["serpapi", "serper"], cfgs, diagnose=False, workers=1)
+    assert "serpapi" in state.dead
+    assert results[0].verdict == V.INDEXED and results[0].engine == "Serper"
+    assert results[1].verdict == V.OTHER  # Serper showed a different link
+    assert state.used["serper"] == 2
+
+
+def test_gsc_first_then_serp(fake):
+    def handler(m, u, kw):
+        if "searchconsole" in u:
+            return _gsc_reply("Submitted and indexed", "PASS")
+        return FakeResp(200, {"organic": []})
+
+    fake(handler)
+    cfgs = {"gsc": FakeGSC(["sc-domain:example.com"]), "serper": {"key": "b"}}
+    results, _ = core.run_checks(["https://example.com/a", TARGET], ["gsc", "serper"], cfgs, diagnose=False, workers=2)
+    assert results[0].engine == "Google Search Console" and results[0].verdict == V.INDEXED
+    assert results[1].engine == "Serper" and results[1].verdict == V.NOT
+    assert "skipped" in results[1].attempts
+
+
+def test_unknown_when_all_engines_fail(fake):
+    fake(lambda m, u, kw: FakeResp(403, text="Unauthorized"))
+    results, state = core.run_checks([TARGET], ["serper"], {"serper": {"key": "x"}}, diagnose=False)
+    assert results[0].verdict == V.UNKNOWN and "serper" in state.dead
+
+
+def test_diagnostics_noindex(fake):
+    page = '<html><head><meta name="robots" content="noindex"><link rel="canonical" href="/other"></head></html>'
+
+    def handler(m, u, kw):
+        if "serper.dev" in u:
+            return FakeResp(200, {"organic": []})
+        return FakeResp(200, text=page, url="https://example.com/a", headers={"Content-Type": "text/html"})
+
+    fake(handler)
+    results, _ = core.run_checks(["https://example.com/a"], ["serper"], {"serper": {"key": "b"}}, diagnose=True)
+    assert "noindex" in results[0].likely_cause and "canonical" in results[0].likely_cause
+
+
+# ---------------------------------------------------------------- sitemap + export
+def test_sitemap_gzip_ignores_images(fake):
+    xml = (b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" '
+           b'xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"><url><loc>https://a.com/1</loc>'
+           b'<image:image><image:loc>https://a.com/i.jpg</image:loc></image:image></url>'
+           b'<url><loc>https://a.com/2</loc></url></urlset>')
+    fake(lambda m, u, kw: FakeResp(200, content=gzip.compress(xml), text="x"))
+    urls, errors = core.fetch_sitemap("https://a.com/sitemap.xml.gz")
+    assert urls == ["https://a.com/1", "https://a.com/2"] and not errors
+
+
+def test_excel_export():
+    df = pd.DataFrame({"Link": ["a"], "Result": [V.INDEXED]})
+    data = core.to_excel(df, {"Total": 1})
+    assert data[:2] == b"PK"
