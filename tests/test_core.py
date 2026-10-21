@@ -76,7 +76,7 @@ def test_judge_cases():
     assert core.judge(TARGET, [(TARGET + "/?srsltid=1", "t")])["verdict"] == V.INDEXED
     assert core.judge(TARGET, [(TARGET.lower(), "t")])["verdict"] == V.OTHER
     assert core.judge(TARGET, [("https://velog.io/@stories", "t")])["verdict"] == V.OTHER
-    assert core.judge(TARGET, [])["verdict"] == V.NOT
+    assert core.judge(TARGET, [])["verdict"] == V.NOTFOUND   # a search can only say "not found"
 
 
 def test_prepare_urls():
@@ -104,7 +104,7 @@ def test_serpapi_no_cache_and_states(fake):
     assert s.calls[0][2]["params"]["no_cache"] == "true"  # fresh results, never cached
 
     fake(lambda m, u, kw: FakeResp(200, {"error": "Google hasn't returned any results for this query."}))
-    assert core.check_serpapi(TARGET, {"key": "k"}, True)["verdict"] == V.NOT
+    assert core.check_serpapi(TARGET, {"key": "k"}, True)["verdict"] == V.NOTFOUND
 
     fake(lambda m, u, kw: FakeResp(429, {"error": "Your account has run out of searches."}))
     with pytest.raises(core.EngineDown, match="used up"):
@@ -122,7 +122,7 @@ def test_brightdata(fake):
     assert sent["zone"] == "z" and "brd_json=1" in sent["url"] and "site%3A" in sent["url"]
 
     fake(lambda m, u, kw: FakeResp(200, {"general": {"results_cnt": 0}}))
-    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.NOT
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.NOTFOUND
 
     fake(lambda m, u, kw: FakeResp(200, text="<html>not json</html>"))
     assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.UNKNOWN
@@ -225,7 +225,7 @@ def test_gsc_first_then_serp(fake):
     cfgs = {"gsc": FakeGSC(["sc-domain:example.com"]), "serper": {"key": "b"}}
     results, _ = core.run_checks(["https://example.com/a", TARGET], ["gsc", "serper"], cfgs, diagnose=False, workers=2)
     assert results[0].engine == "Google Search Console" and results[0].verdict == V.INDEXED
-    assert results[1].engine == "Serper" and results[1].verdict == V.NOT
+    assert results[1].engine == "Serper" and results[1].verdict == V.NOTFOUND
     assert "skipped" in results[1].attempts
 
 
@@ -263,3 +263,39 @@ def test_excel_export():
     df = pd.DataFrame({"Link": ["a"], "Result": [V.INDEXED]})
     data = core.to_excel(df, {"Total": 1})
     assert data[:2] == b"PK"
+
+
+# ---------------------------------------------------------------- added 2026-10-21
+def test_split_input_lines_not_words():
+    got = core.split_input("https://a.example/x\nnot a link\nwww.b.example/y, https://c.example/z\n# note\n\nb.example/p")
+    assert got == ["https://a.example/x", "not a link", "www.b.example/y", "https://c.example/z", "b.example/p"]
+    valid, invalid, dupes = core.prepare_urls(got)
+    assert invalid == ["not a link"] and len(valid) == 4   # one bad line = one invalid entry
+
+
+def test_brightdata_html_reply_is_read(fake):
+    html = '<html><body><a href="/url?q=' + TARGET + '&sa=U"><h3>T</h3></a></body></html>'
+    fake(lambda m, u, kw: FakeResp(200, text=html))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.INDEXED
+    fake(lambda m, u, kw: FakeResp(200, text="<html>Your search did not match any documents.</html>"))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.NOTFOUND
+    fake(lambda m, u, kw: FakeResp(200, {"status_code": 200, "body": json.dumps({"organic": [{"link": TARGET, "title": "T"}]})}))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.INDEXED
+
+
+def test_brightdata_retries_once_then_says_what_came_back(fake):
+    replies = [FakeResp(200, text="<html>weird page</html>"), FakeResp(200, {"organic": [{"link": TARGET, "title": "T"}]})]
+    s = fake(lambda m, u, kw: replies.pop(0))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.INDEXED and len(s.calls) == 2
+    fake(lambda m, u, kw: FakeResp(200, {"error": "zone not active"}))
+    out = core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)
+    assert out["verdict"] == V.UNKNOWN and "zone not active" in out["detail"] and "tried twice" in out["detail"]
+    fake(lambda m, u, kw: FakeResp(200, text="<html>Our systems have detected unusual traffic</html>"))
+    assert "CAPTCHA" in core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["detail"]
+
+
+def test_verdicts_are_honest():
+    assert core.VERDICT_SHORT[V.NOTFOUND] == "Not found on Google" and V.NOTFOUND in core.VERIFIED and V.UNKNOWN not in core.VERIFIED
+    assert "not proof" in core.ENGINES["serper"].proves and "final word" in core.ENGINES["gsc"].proves
+    for e in core.ENGINES.values():   # every allowance names its kind; paid search engines name their official page
+        assert e.kind and e.renew and (e.source or e.key == "direct")

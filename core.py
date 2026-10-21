@@ -3,10 +3,15 @@ IndexPulse core logic — no Streamlit imports, so everything here can be unit-t
 
 Engines (all have a free tier), tried top-to-bottom with automatic fallback:
   1. Google Search Console URL Inspection API — 2,000/day per site, only YOUR verified sites
-  2. Bright Data SERP API                      — 5,000/month, renews on the 1st
-  3. SerpApi                                   — 250/month, renews monthly
-  4. Serper                                    — 2,500 one-time
+  2. Bright Data SERP API                      — 5,000 free credits/month (shared with other Bright Data products)
+  3. SerpApi                                   — Free plan: 250 searches/month, 50/hour
+  4. Serper                                    — 2,500 free queries on sign-up
   5. Direct Google scraping                    — free, local computer only, often blocked
+Quotas: see ENGINES (each has the official source and the date it was checked). docs/KNOWN_LIMITATIONS.md.
+
+Verdicts are honest about what each method can prove:
+  Search Console answers "indexed / not indexed" for your own sites (the final word).
+  A search API can only say "Google search shows / does not show this exact link" — absence is NOT proof.
 """
 
 from __future__ import annotations
@@ -43,28 +48,35 @@ except ImportError:  # pragma: no cover
 # =====================================================================
 class V:
     INDEXED = "🟢 Indexed"
-    OTHER = "🟡 Not indexed — Google shows another link"
+    OTHER = "🟡 Another link shown"
+    NOTFOUND = "🟠 Not found on Google"
     NOT = "🔴 Not indexed"
     UNKNOWN = "⚪ Couldn't check"
 
 
-ALL_VERDICTS = [V.INDEXED, V.OTHER, V.NOT, V.UNKNOWN]
-VERIFIED = {V.INDEXED, V.OTHER, V.NOT}
+ALL_VERDICTS = [V.INDEXED, V.OTHER, V.NOTFOUND, V.NOT, V.UNKNOWN]
+VERIFIED = {V.INDEXED, V.OTHER, V.NOTFOUND, V.NOT}   # Google answered (everything except "Couldn't check")
 
 # (background, text, border) per verdict — used by the UI and the Excel export
 VERDICT_COLORS = {
     V.INDEXED: ("#dcfce7", "#166534", "#86efac"),
     V.OTHER: ("#fef9c3", "#854d0e", "#fde047"),
+    V.NOTFOUND: ("#ffedd5", "#9a3412", "#fdba74"),
     V.NOT: ("#fee2e2", "#991b1b", "#fca5a5"),
     V.UNKNOWN: ("#f1f5f9", "#475569", "#cbd5e1"),
 }
 
 VERDICT_MEANING = {
-    V.INDEXED: "Google has this exact link.",
-    V.OTHER: "Google has something close (another page or version), but not this exact link.",
-    V.NOT: "Google does not have this link.",
-    V.UNKNOWN: "The check failed (blocked, no credits, network). Press Re-check.",
+    V.INDEXED: "Google has this exact link (Search Console says indexed, or a Google search shows it).",
+    V.OTHER: "Google shows a different link (another page, version or capital letters), not this exact one. Usually this one is not indexed.",
+    V.NOTFOUND: "A Google search for this exact link showed nothing. Usually it is not indexed, but a search can miss a page: "
+                "for your own sites, Search Console is the final word.",
+    V.NOT: "Search Console says Google has not indexed this page (your own sites only).",
+    V.UNKNOWN: "The check failed (blocked, no credits, network). Never counted as not indexed. Press Re-check.",
 }
+# short words for cards, filters and exports
+VERDICT_SHORT = {V.INDEXED: "Indexed", V.OTHER: "Another link shown", V.NOTFOUND: "Not found on Google",
+                 V.NOT: "Not indexed", V.UNKNOWN: "Couldn't check"}
 
 
 class EngineDown(Exception):
@@ -78,42 +90,59 @@ class Skip(Exception):
 # =====================================================================
 # ENGINE INFO
 # =====================================================================
+QUOTA_CHECKED = "21 Oct 2026"   # the date the quotas below were checked against each provider's own page
+
+
 @dataclass(frozen=True)
 class EngineInfo:
     key: str
     name: str
-    free: str
-    renew: str
-    note: str
+    free: str          # the free allowance, as the provider states it
+    kind: str          # daily / monthly / sign-up credit / none
+    renew: str         # what the provider says about renewal and expiry (or that it does not say)
+    note: str          # what kind of answer it gives and when to use it
     signup: str
+    source: str        # the official page the allowance comes from
+    proves: str        # what a result from this method can and cannot prove
 
 
 ENGINES: dict[str, EngineInfo] = {
     "gsc": EngineInfo(
-        "gsc", "Google Search Console", "2,000 checks / day per site", "Renews every day",
-        "Most accurate — Google itself tells you the status and when it last crawled the page. "
-        "Only works for sites you own in Search Console. Other links skip to the next method.",
-        "https://search.google.com/search-console",
+        "gsc", "Google Search Console", "2,000 checks per day for each website (600 per minute)", "Daily allowance",
+        "Starts again every day.",
+        "Google's own answer: indexed or not, why, and the last crawl date. Only for websites this account can see "
+        "in Search Console; other links go to the next method.",
+        "https://search.google.com/search-console", "https://developers.google.com/webmaster-tools/limits",
+        "The final word for your own sites.",
     ),
     "brightdata": EngineInfo(
-        "brightdata", "Bright Data", "5,000 checks / month", "Renews on the 1st of every month",
-        "Live Google results. Best free option for backlinks on other people's sites.",
-        "https://brightdata.com/products/serp-api",
+        "brightdata", "Bright Data", "5,000 free credits per month (1 check = 1 credit)", "Monthly allowance",
+        "Resets on the 1st of each month; unused credits do not roll over. Shared with Bright Data's other products. "
+        "Not given on paid pre-commit plans.",
+        "Live Google search results. Best free option for backlinks on other people's sites.",
+        "https://brightdata.com/products/serp-api", "https://docs.brightdata.com/general/account/billing-and-pricing/free-tier",
+        "Shows whether Google search returns this exact link. Not finding it is not proof that it is not indexed.",
     ),
     "serpapi": EngineInfo(
-        "serpapi", "SerpApi", "250 checks / month", "Renews every month",
-        "Live Google results (cache turned off, so results are never old).",
-        "https://serpapi.com/users/sign_up",
+        "serpapi", "SerpApi", "250 searches per month, at most 50 per hour (Free plan)", "Monthly allowance",
+        "Listed per month on the pricing page; the page does not state the reset day. The Test button shows the live balance.",
+        "Live Google search results (cache turned off, so answers are never old).",
+        "https://serpapi.com/users/sign_up", "https://serpapi.com/pricing",
+        "Shows whether Google search returns this exact link. Not finding it is not proof that it is not indexed.",
     ),
     "serper": EngineInfo(
-        "serper", "Serper", "2,500 checks", "One-time — does not renew",
-        "Live Google results. Very fast.",
-        "https://serper.dev",
+        "serper", "Serper", "2,500 free queries when you sign up", "Sign-up credit",
+        "serper.dev does not say whether the free queries renew or expire: treat them as one-time.",
+        "Live Google search results. Very fast.",
+        "https://serper.dev", "https://serper.dev",
+        "Shows whether Google search returns this exact link. Not finding it is not proof that it is not indexed.",
     ),
     "direct": EngineInfo(
-        "direct", "Direct Google (no key)", "Free", "No limit, but Google blocks it fast",
-        "Only use on your own computer. On cloud hosting Google blocks it almost immediately.",
-        "",
+        "direct", "Direct Google (no key)", "No allowance, no key", "None",
+        "Google blocks automated searches quickly (CAPTCHA); on cloud hosting almost at once.",
+        "Only on your own computer, as the last backup.",
+        "", "",
+        "Same as a search API, and often blocked.",
     ),
 }
 ENGINE_ORDER = list(ENGINES)
@@ -213,6 +242,20 @@ def canonical_url(url: str, case_sensitive_path: bool = True) -> str:
 def is_valid_url(url: str) -> bool:
     h = host_of(url)
     return bool(h) and "." in h and " " not in url.strip()
+
+
+def split_input(text: str) -> list[str]:
+    """Pasted text -> entries. One link per line; a line with several links (spaces, commas, tabs) gives each link.
+    A line without any link stays ONE entry, so it is reported once as "not a valid link" (not word by word)."""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p for p in re.split(r"[\s,;]+", line) if p]
+        links = [p for p in parts if re.match(r"^(https?://|www\.)", p, re.I) or (is_valid_url(p) and "/" in p)]
+        out.extend(links if links else [line])
+    return out
 
 
 def prepare_urls(raw: list[str], strict_case: bool = True):
@@ -321,7 +364,7 @@ def judge(target_url: str, items: list[tuple[str, str]], strict_case: bool = Tru
             return {"verdict": V.INDEXED, "detail": "Google has this exact link", "matched_url": link, "serp_title": title}
 
     if not items:
-        return {"verdict": V.NOT, "detail": "Google has no results for this link"}
+        return {"verdict": V.NOTFOUND, "detail": "A Google search for this exact link showed no results"}
 
     loose = canonical_url(target_url, False)
     for link, title in items:
@@ -337,6 +380,31 @@ def judge(target_url: str, items: list[tuple[str, str]], strict_case: bool = Tru
                 "matched_url": link, "serp_title": title}
     link, title = items[0]
     return {"verdict": V.OTHER, "detail": "Google only shows other websites for this link", "matched_url": link, "serp_title": title}
+
+
+def parse_google_html(html: str):
+    """A Google results page (HTML) -> (kind, items). kind: results / no_results / blocked / unreadable."""
+    low = (html or "").lower()
+    if "/sorry/" in low or "unusual traffic" in low or "recaptcha" in low:
+        return "blocked", []
+    if "did not match any documents" in low or "no results found for" in low or "کسی دستاویز سے مماثلت نہیں رکھتی" in (html or ""):
+        return "no_results", []
+    soup = BeautifulSoup(html or "", "html.parser")
+    items, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href, dest = a["href"], ""
+        if href.startswith("/url?"):
+            qs = parse_qs(urlparse(href).query)
+            dest = (qs.get("q") or qs.get("url") or [""])[0]
+        elif href.startswith("http"):
+            dest = href
+        if not dest.startswith("http") or dest in seen or _is_google_host((urlparse(dest).hostname or "").lower()):
+            continue
+        seen.add(dest)
+        h3 = a.find("h3")
+        items.append((dest, h3.get_text(" ", strip=True) if h3 else ""))
+    # No "0 results" message AND no links = a JS wall or a new layout. Saying "not found" would be a lie.
+    return ("results", items) if items else ("unreadable", [])
 
 
 def _google_search_url(url: str, extra: str = "") -> str:
@@ -415,47 +483,75 @@ def check_serpapi(url: str, cfg: dict, strict: bool) -> dict:
 # =====================================================================
 # ENGINE: BRIGHT DATA
 # =====================================================================
+def _brightdata_read(r):
+    """A Bright Data reply -> ("items", [...]) / ("none", []) / ("blocked", why) / ("other", what it was).
+    Handles parsed JSON (brd_json=1), JSON wrapped in {"body": ...}, and plain Google HTML."""
+    data = _json(r)
+    body = data.get("body") if isinstance(data.get("body"), str) else None
+    if body is not None:                                   # some zones wrap the page: {"status_code":..,"body":"..."}
+        try:
+            data = json.loads(body)
+            data = data if isinstance(data, dict) else {}
+        except ValueError:
+            data, text = {}, body
+        else:
+            text = ""
+    else:
+        text = "" if data else (r.text or "")
+    if data and ({"organic", "general", "input"} & set(data)):
+        items = [((o.get("link") or o.get("url") or ""), o.get("title", "")) for o in (data.get("organic") or []) if isinstance(o, dict)]
+        items = [(l, t) for l, t in items if l]
+        return ("items", items) if items else ("none", [])
+    if data:
+        err = data.get("error") or data.get("message") or ""
+        return "other", (f"an error: {str(err)[:80]}" if err else "JSON without search results (keys: " + ", ".join(list(data)[:5]) + ")")
+    if text.strip():
+        kind, items = parse_google_html(text)
+        if kind == "results":
+            return "items", items
+        if kind == "no_results":
+            return "none", []
+        if kind == "blocked":
+            return "blocked", "Google showed a CAPTCHA page"
+        return "other", "a web page without readable results"
+    return "other", "an empty reply"
+
+
 def check_brightdata(url: str, cfg: dict, strict: bool) -> dict:
     payload = {"zone": cfg["zone"], "url": _google_search_url(url, "&brd_json=1"), "format": "raw"}
     headers = {"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"}
-    r = None
-    for attempt in range(2):
+    what = ""
+    for attempt in range(2):                               # one more try: Bright Data sometimes returns a non-search reply
         try:
             r = http().post("https://api.brightdata.com/request", json=payload, headers=headers, timeout=90)
         except requests.RequestException as e:
+            if attempt == 0:
+                continue
             return unknown(f"Bright Data: network problem ({e.__class__.__name__})")
+        body = r.text[:500].lower()
         if r.status_code == 429 and attempt == 0:
             time.sleep(3)
             continue
-        break
-
-    body = r.text[:500].lower()
-    if r.status_code in (401, 403) and any(w in body for w in ("balance", "credit", "quota", "limit")):
-        raise EngineDown("Free credits are used up for this month")
-    if r.status_code in (401, 403):
-        raise EngineDown("API key or zone name is wrong")
-    if r.status_code == 402 or (r.status_code >= 400 and any(w in body for w in ("balance", "credit", "quota"))):
-        raise EngineDown("Free credits are used up for this month")
-    if r.status_code == 429:
-        raise EngineDown("Too many requests — lower the speed")
-    if r.status_code != 200:
-        return unknown(f"Bright Data: error {r.status_code}")
-
-    data = _json(r)
-    if isinstance(data.get("body"), str):  # some zones wrap the page in {"body": "..."}
-        try:
-            data = json.loads(data["body"])
-        except ValueError:
-            data = {}
-    if not data or not ({"organic", "general", "input"} & set(data)):
-        return unknown("Bright Data: reply was not search results — is the zone a SERP API zone?")
-    items = []
-    for o in data.get("organic") or []:
-        if isinstance(o, dict):
-            link = o.get("link") or o.get("url") or ""
-            if link:
-                items.append((link, o.get("title", "")))
-    return judge(url, items, strict)
+        if r.status_code in (401, 403) and any(w in body for w in ("balance", "credit", "quota", "limit")):
+            raise EngineDown("Free credits are used up for this month")
+        if r.status_code in (401, 403):
+            raise EngineDown("API key or zone name is wrong")
+        if r.status_code == 402 or (r.status_code >= 400 and any(w in body for w in ("balance", "credit", "quota"))):
+            raise EngineDown("Free credits are used up for this month")
+        if r.status_code == 429:
+            raise EngineDown("Too many requests — lower the speed")
+        if r.status_code != 200:
+            what = f"error {r.status_code}"
+            continue
+        kind, val = _brightdata_read(r)
+        if kind == "items":
+            return judge(url, val, strict)
+        if kind == "none":
+            return judge(url, [], strict)
+        what = val
+    if what.startswith("JSON without") or what.startswith("a web page"):
+        what += " — is the zone a SERP API zone?"
+    return unknown(f"Bright Data: the reply was {what} (tried twice)" if not what.startswith("error") else f"Bright Data: {what} (tried twice)")
 
 
 # =====================================================================
@@ -491,25 +587,12 @@ def check_direct(url: str, cfg: dict, strict: bool) -> dict:
         raise EngineDown("Google blocked this computer (CAPTCHA)")
     if "consent.google" in r.url:
         return unknown("Direct Google: showed a cookie-consent page")
-    if "did not match any documents" in low or "no results found for" in low or "کسی دستاویز سے مماثلت نہیں رکھتی" in r.text:
+    kind, items = parse_google_html(r.text)
+    if kind == "blocked":
+        raise EngineDown("Google blocked this computer (CAPTCHA)")
+    if kind == "no_results":
         return judge(url, [], strict)
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    items, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        href, dest = a["href"], ""
-        if href.startswith("/url?"):
-            qs = parse_qs(urlparse(href).query)
-            dest = (qs.get("q") or qs.get("url") or [""])[0]
-        elif href.startswith("http"):
-            dest = href
-        if not dest.startswith("http") or dest in seen or _is_google_host((urlparse(dest).hostname or "").lower()):
-            continue
-        seen.add(dest)
-        h3 = a.find("h3")
-        items.append((dest, h3.get_text(" ", strip=True) if h3 else ""))
-    if not items:
-        # No "0 results" message AND no links = a JS wall or new layout. Saying "Not indexed" would be a lie.
+    if kind == "unreadable":
         return unknown("Direct Google: page had no readable results")
     return judge(url, items, strict)
 
@@ -752,13 +835,14 @@ def check_one(url: str, state: RunState, cfgs: dict, strict: bool = True, diagno
     res.attempts = " | ".join(attempts)
     if not res.proof_link:
         res.proof_link = google_proof_link(url)
-    if diagnose and res.verdict in (V.NOT, V.OTHER) and not (chosen and chosen[0] == "gsc"):
+    if diagnose and res.verdict in (V.NOTFOUND, V.OTHER) and not (chosen and chosen[0] == "gsc"):
         page_diagnostics(res)
     return res
 
 
-def run_checks(urls, engines, cfgs, strict=True, diagnose=True, workers=5, on_progress=None):
-    """Checks every URL live. Returns (results in input order, RunState)."""
+def run_checks(urls, engines, cfgs, strict=True, diagnose=True, workers=5, on_progress=None, on_result=None):
+    """Checks every URL live. Returns (results in input order, RunState).
+    on_result(url, result) is called as each link finishes, so a run that is stopped half-way keeps what it has."""
     state = RunState(engines)
     results: dict[str, CheckResult] = {}
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
@@ -770,14 +854,40 @@ def run_checks(urls, engines, cfgs, strict=True, diagnose=True, workers=5, on_pr
             except Exception as e:  # noqa: BLE001
                 results[u] = CheckResult(url=u, verdict=V.UNKNOWN, detail=f"Internal error ({e.__class__.__name__})",
                                          checked_at=now_utc(), proof_link=google_proof_link(u))
+            if on_result:
+                on_result(u, results[u])
             if on_progress:
                 on_progress(i, len(urls), u, state)
     return [results[u] for u in urls], state
 
 
 # =====================================================================
-# EXCEL EXPORT
+# EXPORTS (CSV / tab text / Excel)
 # =====================================================================
+_FORMULA = re.compile(r"^[=+\-@\t\r]")
+
+
+def cell_safe(v) -> str:
+    """A cell starting with = + - @ would run as a formula in Excel / Google Sheets: keep it text (leading ')."""
+    s = "" if v is None else str(v)
+    return "'" + s if _FORMULA.match(s) and not re.match(r"^[+-]?[\d\s().,-]+$", s) else s
+
+
+def _safe_df(df):
+    return df.astype(str).replace({"nan": "", "None": ""}).apply(lambda col: col.map(cell_safe))
+
+
+def to_csv(df) -> bytes:
+    """UTF-8 with BOM (Excel opens accents and emoji correctly); commas, quotes and line breaks are quoted."""
+    return _safe_df(df).to_csv(index=False).encode("utf-8-sig")
+
+
+def to_tsv(df) -> str:
+    """Tab-separated text for pasting into Google Sheets (tabs / line breaks inside a cell become spaces)."""
+    return _safe_df(df).replace(r"[\t\r\n]+", " ", regex=True).to_csv(sep="\t", index=False)
+
+
+
 def to_excel(df, summary: dict, verdict_col: str = "Result") -> bytes:
     import pandas as pd
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -798,6 +908,10 @@ def to_excel(df, summary: dict, verdict_col: str = "Result") -> bytes:
                 ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 60)
         ws = w.sheets["Index Check"]
         ws.auto_filter.ref = ws.dimensions
+        for row in ws.iter_rows(min_row=2):          # text that starts with "=" must stay text, never a formula
+            for c in row:
+                if c.data_type == "f":
+                    c.data_type = "s"
         if verdict_col in df.columns:
             vcol = df.columns.get_loc(verdict_col) + 1
             for row in ws.iter_rows(min_row=2, min_col=vcol, max_col=vcol):

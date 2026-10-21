@@ -5,9 +5,10 @@ Links paste karein, tool har link ke liye **live** batata hai ke Google ke paas 
 | Color | Matlab |
 |---|---|
 | 🟢 **Indexed** | Google ke paas yehi exact link hai |
-| 🟡 **Not indexed — Google shows another link** | Google koi milta-julta page dikha raha hai, yeh exact link nahi |
-| 🔴 **Not indexed** | Google ke paas yeh link nahi hai |
-| ⚪ **Couldn't check** | Check fail hua (block, credits khatam, internet). **Re-check** dabayein |
+| 🟡 **Another link shown** | Google koi doosra link dikha raha hai (doosra page, version ya capital letters), yeh exact link nahi |
+| 🟠 **Not found on Google** | Google search mein yeh link nahi aaya. Aksar matlab not indexed, magar search kabhi page miss kar deti hai |
+| 🔴 **Not indexed** | Search Console ne kaha: index nahi (sirf aap ki apni sites) |
+| ⚪ **Couldn't check** | Check fail hua (block, credits khatam, internet). Kabhi "not indexed" nahi gina jata. **Re-check** dabayein |
 
 Har result ke saath **Proof ↗** link hota hai — click karke khud Google (ya Search Console) mein dekh lein.
 
@@ -15,12 +16,14 @@ Har result ke saath **Proof ↗** link hota hai — click karke khud Google (ya 
 
 ## Free checking methods (upar se neeche try hote hain)
 
+Allowances 21 Oct 2026 ko har provider ke apne page se check kiye. Tafseel aur sources: `docs/KNOWN_LIMITATIONS.md`.
+
 | # | Method | Free | Kab use hota hai |
 |---|---|---|---|
 | 1 | **Google Search Console** | 2,000 / din per site | Sirf aapki apni verified sites. Sabse accurate + last crawl date |
-| 2 | **Bright Data SERP API** | 5,000 / mahina (har 1 tareekh renew) | Backlinks — sab se best free option |
-| 3 | **SerpApi** | 250 / mahina | Backup (cache off — hamesha fresh) |
-| 4 | **Serper** | 2,500 (ek baar) | Backup |
+| 2 | **Bright Data SERP API** | 5,000 free credits / mahina (1 tareekh ko reset, Bright Data ke doosre products ke saath shared) | Backlinks — sab se best free option |
+| 3 | **SerpApi** | 250 / mahina, 50 / ghanta (Free plan) | Backup (cache off — hamesha fresh). Test button live balance dikhata hai |
+| 4 | **Serper** | 2,500 sign-up par | Backup. serper.dev nahi batata renew/expire hota hai ya nahi: ek dafa wala samjhein |
 | 5 | **Direct Google** | Free, no key | Sirf apne computer par. Cloud par Google foran block karta hai |
 
 Agar ek method ke credits khatam ho jayein, ya key ghalat ho, toh tool **khud** agle method par chala jata hai.
@@ -91,7 +94,8 @@ Har method ke box mein **Test this method** button hai — key sahi hai ya nahi,
 ## Tests
 
 ```bash
-pip install pytest
+pip install pytest playwright
 pytest -q
 ```
+Tafseel: `docs/TESTING.md`. Developers ke liye: `CLAUDE.md`.
 Tests fake API replies use karte hain — koi credit kharch nahi hota, internet ki zaroorat nahi.
