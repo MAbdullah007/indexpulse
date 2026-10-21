@@ -244,16 +244,29 @@ def is_valid_url(url: str) -> bool:
     return bool(h) and "." in h and " " not in url.strip()
 
 
+_HOST_OK = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$", re.I)
+
+
+def _looks_like_link(tok: str) -> bool:
+    t = tok.strip().strip("\"'<>,;")
+    if re.match(r"^(https?://|www\.)", t, re.I):
+        return True
+    return bool(_HOST_OK.match(host_of(t) or "")) and " " not in t
+
+
 def split_input(text: str) -> list[str]:
-    """Pasted text -> entries. One link per line; a line with several links (spaces, commas, tabs) gives each link.
-    A line without any link stays ONE entry, so it is reported once as "not a valid link" (not word by word)."""
+    """Pasted text -> entries. One link per line; several links on one line (spaces, tabs, or a comma / semicolon right
+    before the next link) give each link. Commas INSIDE a link are kept (…/Washington,_D.C. or ?ids=1,2).
+    A line without any link stays ONE entry, so it is reported once as "not a link" (not word by word)."""
     out = []
     for line in (text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = [p for p in re.split(r"[\s,;]+", line) if p]
-        links = [p for p in parts if re.match(r"^(https?://|www\.)", p, re.I) or (is_valid_url(p) and "/" in p)]
+        toks = []
+        for t in line.split():
+            toks += [x for x in re.split(r"[,;](?=\s*(?:https?://|www\.))", t) if x]
+        links = [t.strip().strip("\"'<>,;") for t in toks if _looks_like_link(t)]
         out.extend(links if links else [line])
     return out
 
@@ -385,8 +398,6 @@ def judge(target_url: str, items: list[tuple[str, str]], strict_case: bool = Tru
 def parse_google_html(html: str):
     """A Google results page (HTML) -> (kind, items). kind: results / no_results / blocked / unreadable."""
     low = (html or "").lower()
-    if "/sorry/" in low or "unusual traffic" in low or "recaptcha" in low:
-        return "blocked", []
     if "did not match any documents" in low or "no results found for" in low or "کسی دستاویز سے مماثلت نہیں رکھتی" in (html or ""):
         return "no_results", []
     soup = BeautifulSoup(html or "", "html.parser")
@@ -403,8 +414,13 @@ def parse_google_html(html: str):
         seen.add(dest)
         h3 = a.find("h3")
         items.append((dest, h3.get_text(" ", strip=True) if h3 else ""))
+    if items:
+        return "results", items
+    # a real CAPTCHA page (only when nothing could be read: the query itself can contain words like "recaptcha")
+    if any(m in low for m in ('action="/sorry/index"', "id=\"captcha-form\"", "g-recaptcha", "our systems have detected unusual traffic")):
+        return "blocked", []
     # No "0 results" message AND no links = a JS wall or a new layout. Saying "not found" would be a lie.
-    return ("results", items) if items else ("unreadable", [])
+    return "unreadable", []
 
 
 def _google_search_url(url: str, extra: str = "") -> str:
@@ -562,7 +578,8 @@ _direct_last = [0.0]
 
 
 def _is_google_host(h: str) -> bool:
-    return "google." in h or h.endswith(("gstatic.com", "googleusercontent.com", "googleadservices.com"))
+    """google.com, www.google.co.uk, maps.google.de … (a whole label "google"), not lovegoogle.com."""
+    return bool(re.search(r"(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$", h)) or h.endswith(("gstatic.com", "googleusercontent.com", "googleadservices.com"))
 
 
 def check_direct(url: str, cfg: dict, strict: bool) -> dict:
@@ -588,7 +605,7 @@ def check_direct(url: str, cfg: dict, strict: bool) -> dict:
     if "consent.google" in r.url:
         return unknown("Direct Google: showed a cookie-consent page")
     kind, items = parse_google_html(r.text)
-    if kind == "blocked":
+    if kind == "blocked" or (kind != "results" and "/sorry/" in r.url):
         raise EngineDown("Google blocked this computer (CAPTCHA)")
     if kind == "no_results":
         return judge(url, [], strict)
@@ -707,6 +724,8 @@ def check_gsc(url: str, client: GSCClient, strict: bool) -> dict:
 
     res = _json(r).get("inspectionResult", {})
     idx = res.get("indexStatusResult", {})
+    if not idx:                                   # an empty reply is not "not indexed"
+        return unknown("Search Console: the reply had no index status")
     cs = idx.get("coverageState") or "Unknown status"
     cs_l = cs.lower()
     gc = idx.get("googleCanonical", "")
@@ -782,7 +801,8 @@ class RunState:
     def __init__(self, engines: list[str]):
         self.engines = engines
         self.dead: dict[str, str] = {}
-        self.used: dict[str, int] = {e: 0 for e in engines}
+        self.used: dict[str, int] = {e: 0 for e in engines}       # calls made (credits spent)
+        self.answered: dict[str, int] = {e: 0 for e in engines}   # calls that gave a clear answer (proves it works)
         self._lock = threading.Lock()
 
     def is_dead(self, e: str) -> bool:
@@ -793,9 +813,11 @@ class RunState:
         with self._lock:
             self.dead.setdefault(e, reason)
 
-    def count(self, e: str) -> None:
+    def count(self, e: str, answered: bool = True) -> None:
         with self._lock:
             self.used[e] += 1
+            if answered:
+                self.answered[e] += 1
 
 
 def check_one(url: str, state: RunState, cfgs: dict, strict: bool = True, diagnose: bool = True) -> CheckResult:
@@ -816,7 +838,7 @@ def check_one(url: str, state: RunState, cfgs: dict, strict: bool = True, diagno
             continue
         except Exception as ex:  # noqa: BLE001
             out = unknown(f"{name}: unexpected error ({ex.__class__.__name__})")
-        state.count(e)
+        state.count(e, out["verdict"] != V.UNKNOWN)
         if out["verdict"] == V.UNKNOWN:
             attempts.append(out["detail"])
             continue  # try the next engine instead of giving up
@@ -845,7 +867,8 @@ def run_checks(urls, engines, cfgs, strict=True, diagnose=True, workers=5, on_pr
     on_result(url, result) is called as each link finishes, so a run that is stopped half-way keeps what it has."""
     state = RunState(engines)
     results: dict[str, CheckResult] = {}
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+    ex = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    try:
         futures = {ex.submit(check_one, u, state, cfgs, strict, diagnose): u for u in urls}
         for i, f in enumerate(as_completed(futures), start=1):
             u = futures[f]
@@ -858,6 +881,12 @@ def run_checks(urls, engines, cfgs, strict=True, diagnose=True, workers=5, on_pr
                 on_result(u, results[u])
             if on_progress:
                 on_progress(i, len(urls), u, state)
+    except BaseException:
+        # stopped (Streamlit stops a run by raising inside on_progress): cancel the links not started yet, so no more
+        # credits are spent and the page does not wait for the whole list
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
     return [results[u] for u in urls], state
 
 
@@ -890,8 +919,12 @@ def to_tsv(df) -> str:
 
 def to_excel(df, summary: dict, verdict_col: str = "Result") -> bytes:
     import pandas as pd
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
     from openpyxl.styles import Alignment, Font, PatternFill
 
+    # control characters (they can come from page titles or meta tags) are not allowed in .xlsx: drop them
+    df = df.apply(lambda col: col.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v))
+    summary = {k: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v for k, v in summary.items()}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="Index Check")

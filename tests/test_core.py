@@ -4,6 +4,7 @@ These tests use fake API replies, so they cost no credits and need no internet.
 """
 
 import gzip
+import time as time_mod
 import json
 import os
 import sys
@@ -299,3 +300,73 @@ def test_verdicts_are_honest():
     assert "not proof" in core.ENGINES["serper"].proves and "final word" in core.ENGINES["gsc"].proves
     for e in core.ENGINES.values():   # every allowance names its kind; paid search engines name their official page
         assert e.kind and e.renew and (e.source or e.key == "direct")
+
+
+# ---------------------------------------------------------------- review fixes (2026-10-21)
+def test_split_input_keeps_commas_inside_links():
+    got = core.split_input("https://en.wikipedia.org/wiki/Washington,_D.C.\nhttps://a.example/p?ids=1,2\n"
+                           "example.com, https://a.example/x;https://b.example/y\nsee e.g. this")
+    assert got == ["https://en.wikipedia.org/wiki/Washington,_D.C.", "https://a.example/p?ids=1,2",
+                   "example.com", "https://a.example/x", "https://b.example/y", "see e.g. this"]
+
+
+def test_query_words_are_not_a_captcha():
+    page = '<html><title>site:blog.example/recaptcha-setup unusual-traffic</title><a href="/url?q=https://blog.example/recaptcha-setup"><h3>T</h3></a></html>'
+    assert core.parse_google_html(page)[0] == "results"
+    assert core.parse_google_html('<form action="/sorry/index"><div class="g-recaptcha"></div></form>')[0] == "blocked"
+    assert not core._is_google_host("lovegoogle.com") and core._is_google_host("www.google.co.uk") and core._is_google_host("google.com")
+
+
+def test_gsc_empty_reply_is_couldnt_check(fake):
+    c = core.GSCClient.__new__(core.GSCClient)
+    c.sites, c.exhausted, c.email = ["sc-domain:velog.io"], set(), "x"
+    c.token = lambda: "t"
+    fake(lambda m, u, kw: FakeResp(200, {"inspectionResult": {}}))
+    assert core.check_gsc(TARGET, c, True)["verdict"] == V.UNKNOWN
+
+
+def test_couldnt_check_does_not_prove_a_method_works():
+    st = core.RunState(["serper"])
+    core.ENGINE_FUNCS["_t"] = None
+    orig = core.ENGINE_FUNCS["serper"]
+    core.ENGINE_FUNCS["serper"] = lambda u, cfg, s: core.unknown("Serper: error 500")
+    try:
+        core.check_one(TARGET, st, {}, True, False)
+    finally:
+        core.ENGINE_FUNCS["serper"] = orig
+        core.ENGINE_FUNCS.pop("_t", None)
+    assert st.used["serper"] == 1 and st.answered["serper"] == 0
+
+
+def test_stopped_run_cancels_the_rest():
+    import threading
+    calls = []
+    lock = threading.Lock()
+
+    def slow(u, cfg, s):
+        with lock:
+            calls.append(u)
+        time_mod.sleep(0.2)
+        return core.judge(u, [], s)
+
+    orig = core.ENGINE_FUNCS["serper"]
+    core.ENGINE_FUNCS["serper"] = slow
+
+    def stop(i, n, u, state):
+        raise KeyboardInterrupt  # like Streamlit stopping the script
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            core.run_checks([f"https://s{i}.example/p" for i in range(10)], ["serper"], {}, True, False, workers=2, on_progress=stop)
+    finally:
+        core.ENGINE_FUNCS["serper"] = orig
+    time_mod.sleep(0.6)
+    assert len(calls) < 10, f"{len(calls)} of 10 links still ran after the stop"
+
+
+def test_excel_drops_control_characters():
+    import io as _io
+    from openpyxl import load_workbook
+    df = pd.DataFrame({"Link": ["https://a.example/"], "Google title": ["Bad\x0btitle\x1b"], "Result": [V.INDEXED]})
+    wb = load_workbook(_io.BytesIO(core.to_excel(df, {"x": "y\x0b"})))
+    assert wb["Index Check"]["B2"].value == "Badtitle"

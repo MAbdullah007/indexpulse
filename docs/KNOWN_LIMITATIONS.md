@@ -19,6 +19,13 @@ These are published numbers, not live balances (except SerpApi). Providers chang
 - "Another link shown" can mean a different capital-letter version, another page of the same site, or other sites only (see Why).
 - Page diagnostics open the page from the server: some sites block datacenters, so "Page status" can differ from a browser.
 
+## Fixed after review (21 Oct 2026)
+Stopping a check now cancels the links not started (no more credits spent); a stopped Re-check keeps every earlier row;
+a search whose words contain "recaptcha" is no longer read as a CAPTCHA; a method whose every reply was "Couldn't check" no
+longer turns green; an empty Search Console reply is "Couldn't check", not "Not indexed"; the password works in any language;
+control characters no longer break the Excel export; GSC_JSON works as pasted text with line breaks or as a TOML table;
+the row details follow the filtered table; commas inside links are kept.
+
 ## Open
 - Bright Data: in a real run (Oct 2026) some replies were "not search results". Now read as JSON, wrapped JSON or Google HTML,
   retried once, and the message says what came back; if it stays, check the zone is a **SERP API** zone.

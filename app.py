@@ -142,7 +142,7 @@ if APP_PASSWORD and not st.session_state.get("authed"):
                 unsafe_allow_html=True)
     pw = st.text_input("Password", type="password")
     if pw:
-        if hmac.compare_digest(pw, str(APP_PASSWORD)):
+        if hmac.compare_digest(pw.encode("utf-8"), str(APP_PASSWORD).encode("utf-8")):   # bytes: any language works
             st.session_state["authed"] = True
             st.rerun()
         st.error("Wrong password.")
@@ -155,10 +155,12 @@ if APP_PASSWORD and not st.session_state.get("authed"):
 def gsc_info():
     if st.session_state.get("gsc_info"):
         return st.session_state["gsc_info"]
-    raw = secret("GSC_JSON", "")  # whole JSON file pasted as one secret (easiest)
+    raw = secret("GSC_JSON", "")  # whole JSON file pasted as one secret (easiest), or written as a TOML table
     if raw:
+        if hasattr(raw, "keys"):
+            return dict(raw)
         try:
-            return json.loads(raw)
+            return json.loads(str(raw), strict=False)   # strict=False: a pasted key can contain real line breaks
         except ValueError:
             st.session_state["gsc_error"] = "GSC_JSON in Secrets is not valid JSON — paste the whole file again."
     s = secret("gsc_service_account", None)
@@ -316,7 +318,7 @@ def provider_card(i: int, e: str):
                 c = gsc_client()
                 if c:
                     st.markdown(pill(f"Logged in as {esc(c.email)}", "green"), unsafe_allow_html=True)
-                elif st.session_state.get("gsc_error") and gsc_info():
+                elif st.session_state.get("gsc_error"):
                     st.error(st.session_state["gsc_error"])
             elif e == "brightdata":
                 st.text_input("API key", key="brd_key", type="password")
@@ -434,6 +436,8 @@ def prepare_engines(engines: list[str]) -> list[str]:
     """Search Console needs its site list before it can route links."""
     if "gsc" in engines:
         c = gsc_client()
+        if c:
+            c.exhausted.clear()   # a site that hit the limit in an earlier run gets a fresh try
         try:
             if c.sites is None:
                 c.list_sites()
@@ -454,7 +458,8 @@ def do_run(link_list: list[str]):
         return None
     bar = st.progress(0.0, text=f"Checking 0 of {len(link_list)} links…")
     started = time.time()
-    partial = st.session_state["partial"] = {"total": len(link_list), "results": {}, "at": core.now_utc()}
+    partial = st.session_state["partial"] = {"total": len(link_list), "results": {}, "at": core.now_utc(),
+                                             "merge": bool(st.session_state.get("rechecking"))}
 
     def on_result(u, res):  # kept even if the run is stopped half-way
         partial["results"][u] = res
@@ -467,7 +472,7 @@ def do_run(link_list: list[str]):
     bar.empty()
     st.session_state.pop("partial", None)
     st.session_state["dead"] = dict(state.dead)
-    for e, n in state.used.items():  # an engine that answered in this check is proven to work
+    for e, n in state.answered.items():  # only a clear answer proves a method works ("Couldn't check" does not)
         if n and e not in state.dead and st.session_state["tested"].get(e, ("",))[0] != "ok":
             st.session_state["tested"][e] = ("ok", "Answered in the last check.", hhmm(), None)
     return results, state, round(time.time() - started, 1)
@@ -503,10 +508,14 @@ if part and part["results"]:
     got = list(part["results"].values())
     st.warning(f"The last check stopped after {len(got)} of {part['total']} links (the page was changed while it ran). "
                "The finished links are shown below; press Check again for the rest.")
-    st.session_state["results"] = got
-    st.session_state["run_meta"] = {"secs": 0, "used": {}, "dead": dict(st.session_state["dead"]), "at": part["at"],
-                                    "total": part["total"], "partial": True}
+    if part.get("merge") and st.session_state.get("results"):   # a stopped Re-check: keep every earlier row
+        st.session_state["results"] = [part["results"].get(r.url, r) for r in st.session_state["results"]]
+    else:
+        st.session_state["results"] = got
+        st.session_state["run_meta"] = {"secs": 0, "used": {}, "dead": dict(st.session_state["dead"]), "at": part["at"],
+                                        "total": part["total"], "partial": True}
     st.session_state.pop("partial", None)
+    st.session_state.pop("rechecking", None)
 
 # =====================================================================
 # STEP 4 — RESULTS
@@ -559,7 +568,9 @@ if results:
     unknown_urls = [r.url for r in results if r.verdict == V.UNKNOWN]
     if unknown_urls and st.button(f"🔁  Re-check the {len(unknown_urls)} link{'s' if len(unknown_urls) != 1 else ''} that could not be checked",
                                   disabled=not ready):
+        st.session_state["rechecking"] = True
         out = do_run(unknown_urls)
+        st.session_state.pop("rechecking", None)
         if out:
             new, state, _ = out
             by_url = {r.url: r for r in new}
@@ -603,7 +614,8 @@ if results:
     if len(view):
         sel = st.dataframe(
             styler, width="stretch", hide_index=True, height=min(36 * (len(shown) + 1) + 6, 560),
-            on_select="rerun", selection_mode="single-row", key="table",
+            on_select="rerun", selection_mode="single-row",
+            key=f"table_{core.ALL_VERDICTS.index(flt) if flt else 'all'}_{abs(hash((search, tuple(pick_m), show_tech))) % 10**8}",
             column_config={
                 "Link": st.column_config.LinkColumn(width="medium"),
                 "Result": st.column_config.TextColumn(width="medium"),

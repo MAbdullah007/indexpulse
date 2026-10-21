@@ -76,3 +76,25 @@ def test_exports_are_safe():
     wb = load_workbook(io.BytesIO(core.to_excel(df, {"Links checked": 2})))
     ws = wb["Index Check"]
     assert all(c.data_type != "f" for row in ws.iter_rows() for c in row) and ws.auto_filter.ref
+
+
+def test_stopped_recheck_keeps_every_earlier_row(at):
+    rs = [core.CheckResult(url=f"https://s{i}.example/", verdict=core.V.UNKNOWN if i == 1 else core.V.INDEXED, detail="x",
+                           engine="Serper", checked_at="t") for i in range(3)]
+    at.session_state["results"] = rs
+    at.session_state["run_meta"] = {"at": "t", "total": 3, "used": {}, "dead": {}}
+    fixed = core.CheckResult(url="https://s1.example/", verdict=core.V.INDEXED, detail="y", engine="Serper", checked_at="t2")
+    at.session_state["partial"] = {"total": 1, "results": {fixed.url: fixed}, "at": "t2", "merge": True}
+    at.run()
+    res = at.session_state["results"]
+    assert len(res) == 3 and res[1].verdict == core.V.INDEXED
+
+
+def test_password_in_any_language():
+    a = AppTest.from_file(os.path.join(HERE, "harness_app.py"), default_timeout=60)
+    a.secrets["APP_PASSWORD"] = "pässwörd-پاس"
+    a.run()
+    a.text_input[0].set_value("wrong-ü").run()
+    assert not a.exception and any("Wrong password" in e.value for e in a.error)
+    a.text_input[0].set_value("pässwörd-پاس").run()
+    assert not a.exception and a.session_state["authed"]
