@@ -370,3 +370,10 @@ def test_excel_drops_control_characters():
     df = pd.DataFrame({"Link": ["https://a.example/"], "Google title": ["Bad\x0btitle\x1b"], "Result": [V.INDEXED]})
     wb = load_workbook(_io.BytesIO(core.to_excel(df, {"x": "y\x0b"})))
     assert wb["Index Check"]["B2"].value == "Badtitle"
+
+
+def test_brightdata_data_without_results_is_not_not_found(fake):
+    fake(lambda m, u, kw: FakeResp(200, {"general": {"query": "x"}}))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.UNKNOWN
+    fake(lambda m, u, kw: FakeResp(200, {"organic": []}))
+    assert core.check_brightdata(TARGET, {"key": "k", "zone": "z"}, True)["verdict"] == V.NOTFOUND

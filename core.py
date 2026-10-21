@@ -517,7 +517,13 @@ def _brightdata_read(r):
     if data and ({"organic", "general", "input"} & set(data)):
         items = [((o.get("link") or o.get("url") or ""), o.get("title", "")) for o in (data.get("organic") or []) if isinstance(o, dict)]
         items = [(l, t) for l, t in items if l]
-        return ("items", items) if items else ("none", [])
+        if items:
+            return "items", items
+        # "nothing found" only when the reply says so: an empty organic list, or Google's own count of 0
+        gen = data.get("general") if isinstance(data.get("general"), dict) else {}
+        if isinstance(data.get("organic"), list) or gen.get("results_cnt") in (0, "0"):
+            return "none", []
+        return "other", "search data without results (maybe a consent or CAPTCHA page)"
     if data:
         err = data.get("error") or data.get("message") or ""
         return "other", (f"an error: {str(err)[:80]}" if err else "JSON without search results (keys: " + ", ".join(list(data)[:5]) + ")")
